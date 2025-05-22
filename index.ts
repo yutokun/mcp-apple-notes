@@ -100,6 +100,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
+        name: "index-status",
+        description: "Check the current indexing status of Apple Notes",
+        inputSchema: {
+          type: "object",
+          properties: {},
+          required: [],
+        },
+      },
+      {
+        name: "index-batch",
+        description: "Index a specific batch of notes (for manual control)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            batchSize: { type: "number", description: "Number of notes to process (default: 5)" },
+            startIndex: { type: "number", description: "Starting index (default: current count)" }
+          },
+          required: [],
+        },
+      },
+      {
         name: "list-notes",
         description: "Lists just the titles of all my Apple Notes",
         inputSchema: {
@@ -222,6 +243,107 @@ const getNoteDetailsByTitle = async (title: string) => {
     }
     throw error;
   }
+};
+
+// 段階的インデックス用の新しい関数を追加
+const incrementalIndexNotes = async (notesTable: any, batchSize: number = 5, startIndex: number = 0) => {
+  const start = performance.now();
+  
+  console.error(`Starting incremental indexing from note ${startIndex}...`);
+  
+  const allNotes = (await getNotes()) || [];
+  console.error(`Found ${allNotes.length} total notes`);
+  
+  if (startIndex >= allNotes.length) {
+    return {
+      chunks: 0,
+      report: "No more notes to index",
+      allNotes: allNotes.length,
+      processed: 0,
+      nextIndex: allNotes.length,
+      time: performance.now() - start,
+      completed: true
+    };
+  }
+  
+  const endIndex = Math.min(startIndex + batchSize, allNotes.length);
+  const batchNotes = allNotes.slice(startIndex, endIndex);
+  
+  console.error(`Processing notes ${startIndex + 1}-${endIndex} of ${allNotes.length}`);
+  
+  const processedNotes: any[] = [];
+  
+  for (let i = 0; i < batchNotes.length; i++) {
+    const note = batchNotes[i];
+    try {
+      console.error(`Processing note ${startIndex + i + 1}: ${note}`);
+      const noteDetails = await getNoteDetailsByTitle(note);
+      if (noteDetails) {
+        processedNotes.push(noteDetails);
+      }
+    } catch (error: any) {
+      console.error(`Error processing note "${note}": ${error.message}`);
+    }
+  }
+
+  if (processedNotes.length > 0) {
+    const chunks = processedNotes.map((note: any, index: number) => {
+      try {
+        const content = note.content || "";
+        const markdownContent = content.includes('<') ? turndown(content) : content;
+        
+        return {
+          id: (startIndex + index).toString(),
+          title: note.title,
+          content: markdownContent,
+          creation_date: note.creation_date,
+          modification_date: note.modification_date,
+        };
+      } catch (error) {
+        console.error(`Processing error for note ${note.title}: ${error}`);
+        return {
+          id: (startIndex + index).toString(),
+          title: note.title,
+          content: note.content || "",
+          creation_date: note.creation_date,
+          modification_date: note.modification_date,
+        };
+      }
+    });
+
+    console.error(`Adding ${chunks.length} chunks to database...`);
+    await notesTable.add(chunks);
+    console.error("Database insertion completed");
+  }
+
+  const totalTime = performance.now() - start;
+  const isCompleted = endIndex >= allNotes.length;
+  
+  console.error(`Processed ${processedNotes.length} notes in ${Math.round(totalTime)}ms`);
+  console.error(`Progress: ${endIndex}/${allNotes.length} (${Math.round(endIndex/allNotes.length*100)}%)`);
+  
+  return {
+    chunks: processedNotes.length,
+    report: `Processed ${processedNotes.length} notes. Progress: ${endIndex}/${allNotes.length}`,
+    allNotes: allNotes.length,
+    processed: endIndex - startIndex,
+    nextIndex: endIndex,
+    time: totalTime,
+    completed: isCompleted
+  };
+};
+
+// データベースの現在の状態を確認する関数
+const getIndexingStatus = async (notesTable: any) => {
+  const allNotes = (await getNotes()) || [];
+  const indexedCount = await notesTable.countRows();
+  
+  return {
+    totalNotes: allNotes.length,
+    indexedNotes: indexedCount,
+    remaining: allNotes.length - indexedCount,
+    progress: Math.round((indexedCount / allNotes.length) * 100)
+  };
 };
 
 // JXAスクリプトを実行するヘルパー関数
@@ -415,19 +537,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request, c) => {
       try {
         const { title } = GetNoteSchema.parse(args);
         const note = await getNoteDetailsByTitle(title);
-
         return createTextResponse(JSON.stringify(note, null, 2));
       } catch (error) {
         return createTextResponse(error.message);
       }
     } else if (name === "index-notes") {
-      const { time, chunks, report, allNotes } = await indexNotes(notesTable);
-      const message = `Indexed ${chunks} notes chunks from ${allNotes} total notes in ${Math.round(time)}ms. You can now search for them using the "search-notes" tool.`;
-      return createTextResponse(message);
+      // まず現在の状態を確認
+      const status = await getIndexingStatus(notesTable);
+      
+      if (status.remaining <= 0) {
+        return createTextResponse(`All ${status.totalNotes} notes are already indexed.`);
+      }
+      
+      // 段階的インデックスを実行（5件ずつ）
+      const result = await incrementalIndexNotes(notesTable, 5, status.indexedNotes);
+      
+      if (result.completed) {
+        return createTextResponse(`Indexing completed! Processed all ${result.allNotes} notes.`);
+      } else {
+        return createTextResponse(
+          `Indexed ${result.chunks} notes in ${Math.round(result.time)}ms. ` +
+          `Progress: ${result.nextIndex}/${result.allNotes} (${Math.round(result.nextIndex/result.allNotes*100)}%). ` +
+          `Run the command again to continue indexing the remaining ${result.allNotes - result.nextIndex} notes.`
+        );
+      }
     } else if (name === "search-notes") {
       const { query } = QueryNotesSchema.parse(args);
       const combinedResults = await searchAndCombineResults(notesTable, query);
       return createTextResponse(JSON.stringify(combinedResults));
+    } else if (name === "index-status") {
+      const status = await getIndexingStatus(notesTable);
+      return createTextResponse(
+        `Indexing Status:\n` +
+        `Total Notes: ${status.totalNotes}\n` +
+        `Indexed Notes: ${status.indexedNotes}\n` +
+        `Remaining: ${status.remaining}\n` +
+        `Progress: ${status.progress}%`
+      );
+    } else if (name === "index-batch") {
+      // Ensure args is an object and provide default values
+      const safeArgs = args && typeof args === 'object' ? args : {};
+      const batchSize = typeof safeArgs.batchSize === 'number' ? safeArgs.batchSize : 5;
+      const startIndex = typeof safeArgs.startIndex === 'number' ? safeArgs.startIndex : await notesTable.countRows();
+      
+      const result = await incrementalIndexNotes(notesTable, batchSize, startIndex);
+      
+      return createTextResponse(
+        `Batch indexing result:\n` +
+        `Processed: ${result.chunks} notes\n` +
+        `Time: ${Math.round(result.time)}ms\n` +
+        `Progress: ${result.nextIndex}/${result.allNotes}\n` +
+        `Completed: ${result.completed ? 'Yes' : 'No'}`
+      );
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }
