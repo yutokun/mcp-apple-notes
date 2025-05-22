@@ -620,7 +620,7 @@ const createTextResponse = (text: string) => ({
 export const searchAndCombineResults = async (
   notesTable: lancedb.Table,
   query: string,
-  limit = 20
+  limit = 10
 ) => {
   const [vectorResults, ftsSearchResults] = await Promise.all([
     (async () => {
@@ -658,7 +658,10 @@ export const searchAndCombineResults = async (
     .slice(0, limit)
     .map(([key]) => {
       const [title, content] = key.split("::");
-      return { title, content };
+      return { 
+        title, 
+        content: content.substring(0, 200) + "..."  // 内容を200文字に制限
+      };
     });
 
   return results;
