@@ -6,9 +6,22 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as lancedb from "@lancedb/lancedb";
-import { runJxa } from "run-jxa";
 import path from "node:path";
 import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
+const runAppleScript = async (script: string): Promise<string> => {
+  try {
+    const { stdout } = await execFileAsync('osascript', ['-e', script]);
+    return stdout.trim();
+  } catch (error) {
+    console.error('AppleScript Error:', error);
+    return '';
+  }
+};
 import TurndownService from "turndown";
 import {
   EmbeddingFunction,
@@ -144,40 +157,52 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-const getNotes = async () => {
-  const notes = await runJxa(`
-    const app = Application('Notes');
-app.includeStandardAdditions = true;
-const notes = Array.from(app.notes());
-const titles = notes.map(note => note.properties().name);
-return titles;
-  `);
-
-  return notes as string[];
+const getNotes = async (): Promise<string[]> => {
+  const script = `
+    tell application "Notes"
+      set noteList to {}
+      set noteCount to count of notes
+      repeat with i from 1 to noteCount
+        set noteName to name of note i
+        copy noteName to end of noteList
+      end repeat
+      return noteList
+    end tell
+  `;
+  
+  const result = await runAppleScript(script);
+  // Convert the AppleScript list to a JavaScript array
+  return result.split(',').map(item => item.trim());
 };
 
 const getNoteDetailsByTitle = async (title: string) => {
-  const note = await runJxa(
-    `const app = Application('Notes');
-    const title = "${title}"
-    
-    try {
-        const note = app.notes.whose({name: title})[0];
+  const escapedTitle = title.replace(/"/g, '\\"');
+  const script = `
+    set json to "{}"
+    tell application "Notes"
+      try
+        set theNote to first note whose name is "${escapedTitle}"
+        set noteTitle to name of theNote
+        set noteContent to body of theNote
+        set creationDate to creation date of theNote
+        set modDate to modification date of theNote
         
-        const noteInfo = {
-            title: note.name(),
-            content: note.body(),
-            creation_date: note.creationDate().toLocaleString(),
-            modification_date: note.modificationDate().toLocaleString()
-        };
+        set AppleScript's text item delimiters to {\"\\\\\", \"\\\\n\"}
+        set noteContent to noteContent's text items
+        set AppleScript's text item delimiters to {\"\\\\\\\"\", \"\\\\\\\\n\"}
+        set noteContent to noteContent as text
         
-        return JSON.stringify(noteInfo);
-    } catch (error) {
-        return "{}";
-    }`
-  );
+        set json to "{\"title\":\"" & noteTitle & "\"," & \
+                  "\"content\":\"" & noteContent & "\"," & \
+                  "\"creation_date\":\"" & (creationDate as text) & "\"," & \
+                  "\"modification_date\":\"" & (modDate as text) & "\"}"
+      end try
+    end tell
+    return json
+  `;
 
-  return JSON.parse(note as string) as {
+  const result = await runAppleScript(script);
+  return JSON.parse(result || '{}') as {
     title: string;
     content: string;
     creation_date: string;
@@ -252,23 +277,24 @@ export const createNotesTable = async (overrideName?: string) => {
 };
 
 const createNote = async (title: string, content: string) => {
-  // Escape special characters and convert newlines to \n
-  const escapedTitle = title.replace(/[\\'"]/g, "\\$&");
+  // Escape special characters for AppleScript
+  const escapedTitle = title.replace(/"/g, '\\"');
   const escapedContent = content
-    .replace(/[\\'"]/g, "\\$&")
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "");
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\\\n')
+    .replace(/\r/g, '');
 
-  await runJxa(`
-    const app = Application('Notes');
-    const note = app.make({new: 'note', withProperties: {
-      name: "${escapedTitle}",
-      body: "${escapedContent}"
-    }});
-    
+  const script = `
+    tell application "Notes"
+      tell account "iCloud"
+        make new note with properties {name:"${escapedTitle}", body:"${escapedContent}"}
+      end tell
+    end tell
     return true
-  `);
+  `;
 
+  await runAppleScript(script);
   return true;
 };
 
