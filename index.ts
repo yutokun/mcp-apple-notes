@@ -260,45 +260,97 @@ const runJXAScript = async (script: string, args: string[] = []): Promise<string
 export const indexNotes = async (notesTable: any) => {
   const start = performance.now();
   let report = "";
+  
+  console.error("Starting note indexing process...");
+  
   const allNotes = (await getNotes()) || [];
-  const notesDetails = await Promise.all(
-    allNotes.map((note) => {
+  console.error(`Found ${allNotes.length} notes to process`);
+  
+  if (allNotes.length === 0) {
+    return {
+      chunks: 0,
+      report: "No notes found",
+      allNotes: 0,
+      time: performance.now() - start,
+    };
+  }
+  
+  const batchSize = 10; // さらに小さなバッチサイズ
+  const batches: string[][] = [];
+  
+  for (let i = 0; i < allNotes.length; i += batchSize) {
+    batches.push(allNotes.slice(i, i + batchSize));
+  }
+  
+  console.error(`Processing ${batches.length} batches of ${batchSize} notes each`);
+  
+  let processedCount = 0;
+  const allNotesDetails: any[] = [];
+  
+  for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+    const batch = batches[batchIndex];
+    console.error(`Processing batch ${batchIndex + 1}/${batches.length} (notes ${processedCount + 1}-${processedCount + batch.length})`);
+    
+    // 各ノートを順次処理（並列処理を避ける）
+    for (const note of batch) {
       try {
-        return getNoteDetailsByTitle(note);
-      } catch (error) {
-        report += `Error getting note details for ${note}: ${error.message}\n`;
-        return {} as any;
+        const noteDetails = await getNoteDetailsByTitle(note);
+        if (noteDetails) {
+          allNotesDetails.push(noteDetails);
+        }
+        processedCount++;
+        
+        if (processedCount % 50 === 0) {
+          console.error(`Processed ${processedCount}/${allNotes.length} notes...`);
+        }
+      } catch (error: any) {
+        console.error(`Error processing note "${note}": ${error.message}`);
+        report += `Error processing note "${note}": ${error.message}\n`;
+        processedCount++;
       }
-    })
-  );
+    }
+  }
 
-  const chunks = notesDetails
-    .filter((n) => n.title)
-    .map((node) => {
+  console.error(`Successfully processed ${allNotesDetails.length} notes, preparing chunks...`);
+
+  const chunks = allNotesDetails
+    .filter((n: any) => n && n.title)
+    .map((note: any, index: number) => {
       try {
+        const content = note.content || "";
+        const markdownContent = content.includes('<') ? turndown(content) : content;
+        
         return {
-          ...node,
-          content: turndown(node.content || ""), // this sometimes fails
+          id: index.toString(),
+          title: note.title,
+          content: markdownContent,
+          creation_date: note.creation_date,
+          modification_date: note.modification_date,
         };
       } catch (error) {
-        return node;
+        console.error(`Processing error for note ${note.title}: ${error}`);
+        return {
+          id: index.toString(),
+          title: note.title,
+          content: note.content || "",
+          creation_date: note.creation_date,
+          modification_date: note.modification_date,
+        };
       }
-    })
-    .map((note, index) => ({
-      id: index.toString(),
-      title: note.title,
-      content: note.content, // turndown(note.content || ""),
-      creation_date: note.creation_date,
-      modification_date: note.modification_date,
-    }));
+    });
 
+  console.error(`Adding ${chunks.length} chunks to database...`);
   await notesTable.add(chunks);
+  console.error("Database insertion completed");
+
+  const totalTime = performance.now() - start;
+  console.error(`Indexing completed in ${Math.round(totalTime)}ms`);
 
   return {
     chunks: chunks.length,
-    report,
+    report: "Indexing completed successfully",
     allNotes: allNotes.length,
-    time: performance.now() - start,
+    time: totalTime,
   };
 };
 
@@ -370,9 +422,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, c) => {
       }
     } else if (name === "index-notes") {
       const { time, chunks, report, allNotes } = await indexNotes(notesTable);
-      return createTextResponse(
-        `Indexed ${chunks} notes chunks in ${time}ms. You can now search for them using the "search-notes" tool.`
-      );
+      const message = `Indexed ${chunks} notes chunks from ${allNotes} total notes in ${Math.round(time)}ms. You can now search for them using the "search-notes" tool.`;
+      return createTextResponse(message);
     } else if (name === "search-notes") {
       const { query } = QueryNotesSchema.parse(args);
       const combinedResults = await searchAndCombineResults(notesTable, query);
