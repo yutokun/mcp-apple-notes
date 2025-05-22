@@ -176,38 +176,85 @@ const getNotes = async (): Promise<string[]> => {
 };
 
 const getNoteDetailsByTitle = async (title: string) => {
-  const escapedTitle = title.replace(/"/g, '\\"');
   const script = `
-    set json to "{}"
-    tell application "Notes"
-      try
-        set theNote to first note whose name is "${escapedTitle}"
-        set noteTitle to name of theNote
-        set noteContent to body of theNote
-        set creationDate to creation date of theNote
-        set modDate to modification date of theNote
+    function run(argv) {
+      const Notes = Application('Notes');
+      const title = argv[0];
+      
+      try {
+        const notes = Notes.notes.whose({ name: title });
+        if (notes.length === 0) {
+          return JSON.stringify({ found: false, error: 'Note not found' });
+        }
         
-        set AppleScript's text item delimiters to {\"\\\\\", \"\\\\n\"}
-        set noteContent to noteContent's text items
-        set AppleScript's text item delimiters to {\"\\\\\\\"\", \"\\\\\\\\n\"}
-        set noteContent to noteContent as text
-        
-        set json to "{\"title\":\"" & noteTitle & "\"," & \
-                  "\"content\":\"" & noteContent & "\"," & \
-                  "\"creation_date\":\"" & (creationDate as text) & "\"," & \
-                  "\"modification_date\":\"" & (modDate as text) & "\"}"
-      end try
-    end tell
-    return json
+        const note = notes[0];
+        return JSON.stringify({
+          found: true,
+          title: note.name(),
+          content: note.body(),
+          creation_date: note.creationDate().toISOString(),
+          modification_date: note.modificationDate().toISOString()
+        });
+      } catch (e) {
+        return JSON.stringify({ found: false, error: e.toString() });
+      }
+    }
   `;
 
-  const result = await runAppleScript(script);
-  return JSON.parse(result || '{}') as {
-    title: string;
-    content: string;
-    creation_date: string;
-    modification_date: string;
-  };
+  try {
+    // osascript -l JavaScript を使用してJXAスクリプトを実行
+    const result = await runJXAScript(script, [title]);
+    const parsed = JSON.parse(result);
+    
+    if (!parsed.found) {
+      throw new Error(parsed.error || `Note with title "${title}" not found`);
+    }
+    
+    return {
+      title: parsed.title,
+      content: parsed.content,
+      creation_date: parsed.creation_date,
+      modification_date: parsed.modification_date
+    };
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error(`Failed to parse JXA result: ${error.message}`);
+    }
+    throw error;
+  }
+};
+
+// JXAスクリプトを実行するヘルパー関数
+const runJXAScript = async (script: string, args: string[] = []): Promise<string> => {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const { execFile } = require('child_process');
+  const { promisify } = require('util');
+  const execFileAsync = promisify(execFile);
+  
+  // 一時ファイルにスクリプトを書き込む方法を使用
+  const tempDir = os.tmpdir();
+  const scriptPath = path.join(tempDir, `jxa_script_${Date.now()}.js`);
+  
+  try {
+    fs.writeFileSync(scriptPath, script);
+    
+    const { stdout, stderr } = await execFileAsync('osascript', ['-l', 'JavaScript', scriptPath, ...args]);
+    
+    if (stderr) {
+      throw new Error(`JXA execution error: ${stderr}`);
+    }
+    
+    return stdout.trim();
+  } finally {
+    // 一時ファイルを削除
+    try {
+      fs.unlinkSync(scriptPath);
+    } catch (e) {
+      // 削除に失敗しても無視
+    }
+  }
 };
 
 export const indexNotes = async (notesTable: any) => {
@@ -317,7 +364,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, c) => {
         const { title } = GetNoteSchema.parse(args);
         const note = await getNoteDetailsByTitle(title);
 
-        return createTextResponse(`${note}`);
+        return createTextResponse(JSON.stringify(note, null, 2));
       } catch (error) {
         return createTextResponse(error.message);
       }
